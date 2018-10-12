@@ -1,0 +1,228 @@
+
+
+#Doc Edge, 6/13/18
+#Goal: Simulate phenotypic scores (possibly under selection) that are additive functions
+# of genotypes at many loci. 
+
+
+#Plan: simulate n_loci allele frequency trajectories.
+#to do this, select an effect size from normal dist with mean 0 and sd
+#equal to heritability over n_loci (from Martin et al). locus undergoes selection 
+#according to effect size and selection gradient of trait (which changes through time). 
+#Generate an allele frequency trajectory obeying the selection coefficient.
+#Do this for all loci and save "phenotype" trajectory.
+#Run through ms and save trees to estimate phenotype trajectory using coalescent times.
+
+
+
+trajs <- list()
+sel.parts <- list()
+eff_sizes <- numeric(0)
+ss <- numeric(0)
+curr.freqs <- numeric(0)
+
+
+#need a constant that reflects a harmonic series from 1 to 2N-1, but only the
+#terms where i/(2N) \in [.01, .99]. for N large this will be very close to the 
+#analogous integral, which is ln(.99) - ln(.01) ~= 4.595
+ser <- 1:(2*N-1)
+harm.const <- sum(1/ser[ser >= .01*2*N & ser <= .99*2*N])
+
+
+
+#Simulate and write n.loci allele-frequency trajectories. None of these should have fixed,
+#so reject and do it again if fixed. Reject if minor allele frequency is < 0.01.
+#shift.achieved <- 0
+traits.attempted <- 0
+#while(shift.achieved == 0){
+	pre.sel.freqs <- numeric(0)
+	post.sel.freqs	<- numeric(0)
+	for(i in 1:n.loci){
+		fix <- 1
+		while(fix == 1){
+			eff_size <- rnorm(1,0,sqrt(herit * sd.trait^2 * harm.const /n.loci))
+			s_locus <- eff_size * sel.intens / sd.trait #Charlesworth B3.7.7
+			ss[i] <- s_locus
+			p0 <- gen.neut.sfs.condit(1, 2*N, .01) #select from neutral sfs conditional on common.
+			pre.sel.freqs[i] <- p0 
+			sel.part.down <- sel.traj(p0, s = -s_locus, N = N, t = t.down - t.up)
+			sel.part.up <- sel.traj(sel.part.down[nrow(sel.part.down),2], s = s_locus, N = N, t = t.up - t.off.up)
+			sel.part.up[,1] <- sel.part.up[,1] + max(sel.part.down[,1])
+			sel.part <- rbind(sel.part.down, sel.part.up[-1,])
+			post.sel.freqs[i] <- sel.part[nrow(sel.part),2]
+			if(t.off.up > 0){
+				post.drift <- neut.traj.time(p0 = sel.part[nrow(sel.part),2], N, t.off.up)
+				sel.part <- rbind(sel.part, cbind(post.drift[,1] + t - t.off.up, post.drift[,2] ))			
+			}
+			if(sel.part[nrow(sel.part),2] >= 0.01 & sel.part[nrow(sel.part),2] <= 0.99){fix = 0}
+		}
+		eff_sizes[i] <- eff_size 
+		curr.freqs[i] <- sel.part[nrow(sel.part),2]
+		sel.parts[[i]] <- sel.part
+	}	
+	#Check whether the achieved shift is close to the target.
+	trait.sd <- sqrt(sum(2 * curr.freqs * (1 - curr.freqs) *eff_sizes^2))
+	#sel.shift <- sum(2 * eff_sizes * (post.sel.freqs - pre.sel.freqs)) / trait.sd
+	#target.shift <- (sel.intens * sd.trait) * (t - t.off) * 2 * N
+	#if(target.shift*.95 <= sel.shift & sel.shift <= target.shift*1.05){shift.achieved <- 1}
+	traits.attempted <- traits.attempted + 1
+	#print("trait attempted")
+#}
+print(paste(as.character(traits.attempted), "histories attempted to achieve target shift."))
+print(Sys.time())
+
+
+for(i in 1:n.loci){
+	sel.part <- sel.parts[[i]]
+	driftup <- neut.traj(pre.sel.freqs[i], N, loss = TRUE)
+	traj.fwd <- rbind(cbind(driftup[,1], rev(driftup[,2])), cbind(sel.part[-1,1] + max(driftup[,1]), sel.part[-1,2] ))
+	traj <- traj.fwd
+	traj[,2] <- rev(traj.fwd[,2])
+	trajs[[i]] <- traj
+	if(i %% 50 == 0){print(paste("trajectory", as.character(i), "simulated"))}
+}
+print(Sys.time())
+
+eff_sizes_unscaled <- eff_sizes
+eff_sizes <- eff_sizes / trait.sd #The SD of the polygenic score is set
+#to be 1 in the present
+
+
+rm(ser)
+rm(harm.const)
+rm(eff_size)
+rm(s_locus)
+rm(p0)
+rm(sel.part)
+#rm(post.drift)
+rm(post.sel.freqs)
+rm(pre.sel.freqs)
+
+
+mat.trajs <- matrixify.list.of.trajs(trajs)
+
+phen.traj <- as.numeric(2 * eff_sizes %*% t(mat.trajs))  
+pt.time <- seq(0, by = 1/(2*N), length.out = max(sapply(trajs, length)/2) )
+
+
+
+
+n_ders <- numeric(n.loci)
+ms_trees_list <- list()
+ms_haplotypes_list <- list()
+
+
+#for each locus, write trajectory, run ms to simulate a sample and tree,
+#and run rent+ to infer tree. Save both the ms and the rent+ trees, as well
+#as the number of derived alleles for each locus.
+for(i in 1:n.loci){
+	write.traj(traj.fn, trajs[[i]])
+	curr.freq.der <- curr.freqs[i]
+	n_der <- rbinom(1, n_chroms, curr.freq.der) #number of chroms with derived allele.
+	if(n_der == 0){n_der <- n_der + 1}
+	if(n_der == n_chroms){n_der <- n_der - 1}
+	n_ders[i] <- n_der
+	#run mssel
+	ms.string <- paste(ms_dir, "mssel ", as.character(n_chroms), " 1 ", as.character(n_chroms - n_der), " ", as.character(n_der), " ", traj.fn, " ", sel_site, " -r ", as.character(4*N*(1 - dbinom(0,len_hap, r))), " ", as.character(len_hap), " -t ", as.character(4*N* (1 - dbinom(0, len_hap, u))), " -T -L > ", msout.fn, sep = "")
+	system(ms.string)
+
+	#cut down mssel output to just the part rent+ needs
+	process.string <- paste("sed '/positions: /,$!d' ", msout.fn, " | sed 's/.*positions: //' > ", rent_in_fn, sep = "")
+	system(process.string)
+
+	ms_haplotypes_list[[i]] <- readLines(rent_in_fn) #save the haplotypes produced by ms (and fed to rent+) in a list entry.
+	#the result will be a character vector. The first entry in the vector is relative (0-1) positions, with the selected
+	#site at 0.05. The remaining entries are string haplotypes of 0s and 1s.
+
+	#pull trees from ms since rent+ hasn't been run
+	msoutlines <- readLines(msout.fn)
+	dists <- numeric(0)
+	for(m in 1:(length(msoutlines) - 4)){
+		suppressWarnings(dists[m] <- as.numeric(substring(strsplit(msoutlines[m + 4], "]")[[1]][1],2)))
+	}
+	dists <- dists[!is.na(dists) & dists != Inf]
+	posits.rs <- cumsum(dists)
+	ms_to_extract <- which.max(posits.rs[posits.rs < sel_site]) + 1
+	if(length(ms_to_extract)  == 0){ms_to_extract <- 1}
+	ms_trees_list[[i]] <- read.tree(text = msoutlines[4 + ms_to_extract])		
+	if(i %% 50 == 0){
+		print(paste("simulation locus", as.character(i), "of trait", as.character(k), "complete"))
+	}
+}
+
+
+#Run through list and check for sites where 2+ variants had same coordinates as
+#selected site. At those places, check which tree(s) are monophyletic for derived tips.
+#if more than one, select randomly from among them.
+for(i in 1:n.loci){
+	if(is.null(names(ms_trees_list[[i]]))){
+		cand.trees <- ms_trees_list[[i]]
+		is.mono <- numeric(0)		
+		for(j in 1:length(cand.trees)){
+			der_tips <- which(cand.trees[[j]]$tip.label %in% as.character((n_chroms - n_ders[i] + 1):n_chroms))
+			is.mono[j] <- is.monophyletic(cand.trees[[j]], der_tips)
+		}
+		if(mean(is.mono) > 0){
+			ind.to.take <- 	sample(which(is.mono == 1), 1)
+		}		
+		if(mean(is.mono) == 0){ #if none are monophyletic, choose at random
+			ind.to.take <- sample(1:length(cand.trees), 1)
+		}
+		ms_trees_list[[i]] <- cand.trees[[ind.to.take]]
+	}
+}
+
+
+
+#split into ancestral and derived trees and retrieve coalescence times.
+anc_trees_ms <- list()
+der_trees_ms <- list()
+ct_ms_all <- list()
+ct_ms_anc <- list()
+ct_ms_der <- list()
+
+
+for(i in 1:n.loci){
+	anc_tips_ms <- which(ms_trees_list[[i]]$tip.label %in% as.character(1:(n_chroms - n_ders[i])))
+	der_tips_ms <- which(ms_trees_list[[i]]$tip.label %in% as.character((n_chroms - n_ders[i] + 1):n_chroms))
+	anc_trees_ms[[i]] <- drop.tip(ms_trees_list[[i]], der_tips_ms)
+	der_trees_ms[[i]] <- drop.tip(ms_trees_list[[i]], anc_tips_ms)
+	ct_ms_all[[i]] <- coal.times(ms_trees_list[[i]])
+	ct_ms_anc[[i]] <- coal.times(anc_trees_ms[[i]])
+	ct_ms_der[[i]] <- coal.times(der_trees_ms[[i]])
+	if(i %% 50 == 0){	
+		print(paste("round", as.character(i), "of tree processing complete"))
+	}
+}
+
+
+
+
+times.c <- list()
+for(i in 1:length(ms_trees_list)){
+	times.c[[i]] <- trees_to_times(ms_trees_list[[i]], anc_trees_ms[[i]], der_trees_ms[[i]], time, sure.alt.is.derived = FALSE, units_in = 4)
+}
+
+lins.list <- list()
+for(i in 1:length(ms_trees_list)){
+	lins.list[[i]] <- times_to_lins(times.c[[i]], time)
+}
+
+
+
+essent.obs <- c("anc_trees_ms","anc_trees_rent","ct_ms_all","ct_ms_anc","ct_ms_der",
+"ct_rent_all","ct_rent_anc", "ct_rent_der", "curr.freqs",             
+"der_trees_ms", "der_trees_rent",      
+"eff_sizes", "eff_sizes_unscaled", "herit", "len_hap", "lins.list",   
+"lins.list.rent", "ms_haplotypes_list", "ms_trees_list", "N", "n_chroms", "n_ders",            
+"n.loci", "out_dir","phen_num","phen.traj", "pt.time", "r",                   
+"rent_trees_list", "sd.trait", "sel_site", "sel.intens", "sel.shift", "t.down", "t.up", "t.off.up", "target.shift", "time", "times.c", "times.c.rent", "trait.sd", "trajs", "u", "lasttree")
+
+fn_str <- paste("loci", as.character(n.loci), "_sintens", as.character(round(sel.intens,3)), "_N", as.character(N), "_nchr", as.character(n_chroms), "_tdown", as.character(t.down), "_tup", as.character(t.up), "_toff", as.character(t.off.up), "_herit", as.character(herit), "_", as.character(phen_num), sep = "")
+
+
+save(file = paste(out_dir, fn_str, ".RData", sep = ""), list = essent.obs[essent.obs %in% ls()])
+
+
+
+
